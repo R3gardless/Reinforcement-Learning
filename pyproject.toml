@@ -1,0 +1,15 @@
+[tool.poetry]
+package-mode = false
+license = "MIT"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+gym = "0.22.0"
+numpy = "^1.26.4"
+pygame = "^2.5.2"
+setuptools = "^69.5.1"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

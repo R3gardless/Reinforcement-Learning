@@ -1,0 +1,6 @@
+.venv
+.DS_Store
+__pycache__/
+
+# Submission file
+*[0-9].py
