@@ -8,6 +8,7 @@ gym = "0.22.0"
 numpy = "^1.26.4"
 pygame = "^2.5.2"
 setuptools = "^69.5.1"
+scikit-learn = "^1.4.2"
 
 
 [build-system]
