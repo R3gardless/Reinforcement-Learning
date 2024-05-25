@@ -3,7 +3,7 @@ package-mode = false
 license = "MIT"
 
 [tool.poetry.dependencies]
-python = "^3.12"
+python = "^3.8"
 gym = "0.22.0"
 pygame = "^2.5.2"
 setuptools = "^69.5.1"
