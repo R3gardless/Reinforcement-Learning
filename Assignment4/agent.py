@@ -13,6 +13,10 @@ ACT_DIM = ENV.action_space.shape[0]
 ACT_LIMIT = ENV.action_space.high[0]
 ENV.close()
 
+ENABLE_GRAD_CLIPPING = True
+GRAD_CLIP_MAX_NORM = 0.5
+
+
 #########################################################################################################################
 ############ 이 template에서는 DO NOT CHANGE 부분을 제외하고 마음대로 수정, 구현 하시면 됩니다                    ############
 #########################################################################################################################
@@ -20,6 +24,7 @@ ENV.close()
 ## 주의 : "InvertedPendulumSwingupBulletEnv-v0"은 continuious action space 입니다.
 ## Asynchronous Advantage Actor-Critic(A3C)를 참고하면 도움이 될 것 입니다.
 
+ 
 class NstepBuffer:
     '''
     Save n-step trainsitions to buffer
@@ -46,7 +51,7 @@ class NstepBuffer:
         sample transitions from buffer
         '''
         return self.states, self.actions, self.rewards, self.next_states, self.dones
-
+    
     def reset(self):
         '''
         reset buffer
@@ -57,77 +62,74 @@ class NstepBuffer:
         self.next_states = []
         self.dones = []
 
+    def __len__(self):
+        return len(self.states)
+
+
 class ActorCritic(nn.Module):
     '''
     Pytorch module for Actor-Critic network
     '''
-    def __init__(self, state_dim=OBS_DIM, action_dim=ACT_DIM, hidden_size=256):
+    def __init__(self, state_dim=OBS_DIM, action_dim=ACT_DIM, hidden_size=64):
         '''
         Define your architecture here
         '''
         super(ActorCritic, self).__init__()
-
-        self.layer1 = nn.Linear(state_dim, hidden_size)
-        self.layer2 = nn.Linear(hidden_size, hidden_size)
-        self.layer3 = nn.Linear(hidden_size, hidden_size)
-    
-        self.actor_layer_mean = nn.Linear(hidden_size, action_dim)
-        self.actor_layer_std = nn.Linear(hidden_size, action_dim)
-
-        self.critic_layer = nn.Linear(hidden_size, 1)
-
-    def forward(self, states):
-        x = F.relu(self.layer1(states))
-        x = F.relu(self.layer2(x))
-        x = F.relu(self.layer3(x))
-
+        self.fc1 = nn.Linear(state_dim, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.actor_fc_mean = nn.Linear(hidden_size, action_dim)
+        self.actor_fc_std = nn.Linear(hidden_size, action_dim)
+        self.fc3 = nn.Linear(hidden_size, 32)
+        self.value_critic = nn.Linear(32, 1)
+        
+    def forward(self, state):
+        x = self.fc1(state) # ReLU activation after first FC layer
+        x = self.fc2(x)      # ReLU activation after second FC layer
         return x
-    
-    def actor(self, states):
+
+    def actor(self, state):
         '''
         Get action distribution (mean, std) for given states
         '''
-        x = self.forward(states)
-        mu = F.tanh(self.actor_layer_mean(x))
-        std = self.actor_layer_std(x)
-        std = torch.clamp(std, 0.001, 0.3)
-
+        x = self.forward(state)
+        mu = torch.tanh(self.actor_fc_mean(x)) * ACT_LIMIT  # action의 범위를 -ACT_LIMIT ~ ACT_LIMIT로 설정
+        std = self.actor_fc_std(x)  # std는 항상 양수이므로 softplus 함수를 통과시켜 양수로 만듦
+        std = torch.clamp(std, 1e-2, 0.3)  # std의 최소값을 1e-2로 설정
         return mu, std
 
-    def critic(self, states):
+    def critic(self, state):
         '''
         Get values for given states
         '''
-        x = self.forward(states)
-        value = self.critic_layer(x)
-        
+        x = self.forward(state)
+        x = F.relu(self.fc3(x))  # ReLU activation before the value prediction
+        value = self.value_critic(x)
         return value
 
-
 class Worker(object):
-    def __init__(self, global_actor, global_epi, sync, finish, n_step, seed, lr=0.001, gamma=0.99):
+    def __init__(self, global_actor, global_epi, sync, finish, n_step, seed, lr=0.0006, gamma=0.99, entropy_coef=0.01):
         self.env = gym.make('InvertedPendulumSwingupBulletEnv-v0')
         self.env.seed(seed)
         self.lr = lr
-        self.gamma = gamma
-        self.entropy_coef = 0.01
-
+        self.gamma = gamma   
+        self.entropy_coef = entropy_coef
+        
         ############################################## DO NOT CHANGE ##############################################
         self.global_actor = global_actor
         self.global_epi = global_epi
         self.sync = sync
         self.finish = finish
         self.optimizer = optim.Adam(self.global_actor.parameters(), lr=self.lr)
-        ############################# ##############################################################################  
+        ###########################################################################################################  
         
         self.n_step = n_step
         self.local_actor = ActorCritic()
-        self.local_actor.load_state_dict(self.global_actor.state_dict())
+        self.local_actor.load_state_dict(global_actor.state_dict())
         self.nstep_buffer = NstepBuffer()
 
     def select_action(self, state):
         '''
-        selects action given state
+        Selects action given state
 
         return:
             continuous action value
@@ -135,52 +137,59 @@ class Worker(object):
         # action [-1, 1]로 clipping
         state = torch.FloatTensor(state).unsqueeze(0)
         mu, std = self.local_actor.actor(state)
+        
         dist = Normal(mu, std)
+
         action = dist.sample()
         action = torch.clamp(action, -ACT_LIMIT, ACT_LIMIT)
 
         return action.data.numpy()[0]
-    
+       
     def train_network(self, states, actions, rewards, next_states, dones):
         '''
         Advantage Actor-Critic training algorithm
         '''
+        rewards_to_go = [] # n-step return을 저장할 리스트
+        discounted_sum = 0 # n-step return을 계산하기 위한 변수
+        for reward, done in zip(reversed(rewards), reversed(dones)): # n-step return 계산
+            if done:
+                discounted_sum = 0 # 마지막 state가 done인 경우 n-step return은 0
+            discounted_sum = reward + (self.gamma * discounted_sum) # n-step return 계산
+            rewards_to_go.insert(0, discounted_sum) # n-step return을 리스트에 저장
+        
+        rewards_to_go = torch.FloatTensor(rewards_to_go) # n-step return을 tensor로 변환
 
-        if len(rewards) == 0: return
-        states = states[0]
-        actions = actions[0]
-        reward = 0
-        for reward in rewards[::-1]:
-            reward = reward + self.gamma * reward
-        next_states = next_states[-1]
-        dones = dones[-1]
+        states = torch.FloatTensor(np.array(states)) # states를 tensor로 변환
+        actions = torch.FloatTensor(np.array(actions)) # actions를 tensor로 변환
 
-        states = torch.FloatTensor(np.array([states]))
-        actions = torch.FloatTensor(np.array([actions]))
-        rewards = torch.FloatTensor(np.array([rewards]))
-        next_states = torch.FloatTensor(np.array([next_states]))
-        dones = torch.FloatTensor(np.array([dones]))
+        values = self.local_actor.critic(states).squeeze() # state에 대한 value를 계산
+        advantage = rewards_to_go - values # advantage 계산
 
-        # Calculate critic loss
-        values = self.local_actor.critic(states)
-        next_values = self.local_actor.critic(next_states)
-        target_values = rewards + self.gamma * next_values * (1 - dones)
-        advantages = target_values - values
-        critic_loss = advantages.pow(2).mean()
+        critic_loss = advantage.pow(2).sum() # critic loss 계산
 
-        # Calculate actor loss
-        mu, std = self.local_actor.actor(states)
-        dist = Normal(mu, std)
-        log_prob = dist.log_prob(actions).sum(-1)
-        entropy = dist.entropy().sum(-1)
-        actor_loss = -(log_prob * advantages.detach()).mean() - self.entropy_coef * entropy
+        mu, std = self.local_actor.actor(states) # state에 대한 mu, std 계산
+        dist = Normal(mu, std) # action distribution 생성 
+        log_probs = dist.log_prob(actions).sum(axis=-1) # log_probs 계산
+        actor_loss = -(log_probs * advantage.detach()).sum() # actor loss 계산
 
-        total_loss = actor_loss + critic_loss
-        # print("Actor Loss: ", actor_loss.item(), "Critic Loss: ", critic_loss.item(), "Total Loss: ", total_loss.item())
+        entropy = dist.entropy().sum() # entropy 계산
+        actor_loss -= self.entropy_coef * entropy # actor loss에 entropy term 추가
+
+        total_loss = actor_loss + critic_loss # total loss 계산
+         
         ############################################## DO NOT CHANGE ##############################################
         # Global optimizer update 준비
-        self.optimizer.zero_grad()
+        
+        # Global Network와 Local Network의 모든 파라미터의 gradients를 0으로 초기화
+        self.optimizer.zero_grad(set_to_none=False)
+        
         total_loss.backward()
+
+        # Gradient Clipping 관련 전역 변수가 정의되어 있는지 확인
+        if 'ENABLE_GRAD_CLIPPING' in globals() and 'GRAD_CLIP_MAX_NORM' in globals():
+            # 활성화 여부에 따라 Gradient Clipping 적용
+            if ENABLE_GRAD_CLIPPING:
+                torch.nn.utils.clip_grad_norm_(parameters=self.local_actor.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
 
         # Local parameter를 global parameter로 전달
         for global_param, local_param in zip(self.global_actor.parameters(), self.local_actor.parameters()):
@@ -203,10 +212,10 @@ class Worker(object):
             while not done:
                 action = self.select_action(state)
                 next_state, reward, done, _ = self.env.step(action)
-                self.nstep_buffer.add(state, action, reward, next_state, done)
+                self.nstep_buffer.add(state, action.item(), reward, next_state, done)
 
                 # n step마다 한 번씩 train_network 함수 실행
-                if step % self.n_step == 0 or done:
+                if len(self.nstep_buffer) % self.n_step == 0 or done:
                     self.train_network(*self.nstep_buffer.sample())
                     self.nstep_buffer.reset()                    
                 

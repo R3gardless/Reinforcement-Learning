@@ -84,7 +84,7 @@ def evaluate(global_actor, global_epi, sync, finish, multi):
                 with finish.get_lock():
                     finish.value = 1
                 print("Achieved score 600!!!, Time : {:.2f}".format(time.time() - start_time))
-            elif n_epi > 100:
+            elif n_epi > 1000:
                 with finish.get_lock():
                     finish.value = 1
                 if np.max(mean_scores) >= 500:
@@ -145,18 +145,20 @@ def model_free_RL(n_steps, multi):
     return worker
 
 
-def evaluate_grid_search(global_actor, global_epi, sync, finish, multi): 
+def evaluate_grid_search(global_actor, global_epi, sync, finish, multi, params): 
     start_time = time.time()
     env = gym.make('InvertedPendulumSwingupBulletEnv-v0')
     env.seed(1)
     recent_scores = deque(maxlen=20)
     mean_scores = []
     n_epi = 0
-
+    max_score = -1000
+    print_result = False
+    f = open("grid_search_performance_log.txt", "a")
     while True:
         # Worker들의 에피소드 카운트가 병렬 프로세스의 개수와 같아지면(각각 한 에피소드씩 끝나면) global actor로 evaluation 
         if global_epi.value == multi:
-            state = env.reset()        
+            state = env.reset()
             score = 0
             done = False
 
@@ -182,85 +184,114 @@ def evaluate_grid_search(global_actor, global_epi, sync, finish, multi):
 
             recent_scores.append(score)
             mean_score = np.mean(recent_scores)
+            max_score = max(max_score, mean_score)
             mean_scores.append(mean_score)
             n_epi += 1
             # if n_epi % 10 == 0:
-            #     print(f'[Episode {n_epi}] Avg. score: {mean_score: .2f}')
+            # print(f'[Episode {n_epi}] Avg. score: {mean_score: .2f}')
 
             if mean_score >= 600:
                 with finish.get_lock():
                     finish.value = 1
-                print("Achieved score 600!!!, Time : {:.2f}".format(time.time() - start_time))
-            elif n_epi > 200:
+                print_result = True
+                f.write(f"{params}\n")
+                f.write(f"{n_epi} {np.mean(mean_scores)} Episode finished! Achieved score 600!!!, Time : {time.time() - start_time}\n")
+                f.write("=============================================\n")
+                f.flush()
+            elif n_epi > 1000:
                 with finish.get_lock():
-                    print(f'Avg. score: {mean_score: .2f}')
                     finish.value = 1
                 if np.max(mean_scores) >= 500:
-                    print("Max episode finished! Achieved score 500!!!")
+                    f.write(f"{params}\n")
+                    f.write(f"Max episode finished! Achieved score 500!!!\n")
                 elif np.max(mean_scores) >= 400:
-                    print("Max episode finished! Achievd score 400!!!")
+                    f.write(f"{params}\n")
+                    f.write(f"Max episode finished! Achievd score 400!!!\n")
                 else:
-                    print("Max episode finished!")
-
+                    f.write(f"{params}\n")
+                    f.write("Max episode finished!\n")
+                f.write(f"Max score: {max_score}, Mean score: {np.mean(mean_scores)}\n")
+                f.write("=============================================\n")
+                f.flush()
             # 학습 종료
             if finish.value == 1:
                 with sync:
                     sync.notify_all()
                 break 
+    f.close()
+
+    if print_result:
+        plt.figure()
+        plt.plot(np.arange(len(mean_scores)), mean_scores)
+        plt.axhline(400, linestyle='--')
+        plt.axhline(500, linestyle='--')
+        plt.axhline(600, linestyle='--')
+        plt.xlabel('Episode')
+        plt.ylabel('Mean Score')
+        plt.savefig('plot.png')
+        plt.close()
+        print('figure saved')  
 
     env.close()
 
 def model_free_RL_grid_search():
-    learning_rate = [0.0001, 0.0003, 0.0005, 0.0007, 0.001]
-    gamma = [0.95, 0.99]
-    n_steps = [2, 4, 8, 16]
-    multi = [2, 4]
-    param_grid = {'learning_rate': learning_rate, 'gamma': gamma, 'n_steps': n_steps, 'multi': multi}
+    learning_rate = [0.0007,0.0006,0.0005,0.0004]
+    gamma = [0.99]
+    n_steps = [16,15]
+    multi = [4]
+    entropy_coef = [0.01]
+
+    param_grid = {'learning_rate': learning_rate, 'gamma': gamma, 'n_steps': n_steps, 'multi': multi, 'entropy_coef': entropy_coef}
 
     grid = ParameterGrid(param_grid)
+    f1 = open("grid_search_log.txt", "w")
+    for _ in range(3):
+        for params in grid:
+            
+            torch.manual_seed(77)
+            np.random.seed(1)
+            start_time = time.time()
+            
+            n_steps = params['n_steps']
+            multi = params['multi']
+            lr = params['learning_rate']
+            gamma = params['gamma']
+            entropy_coef = params['entropy_coef']
+            print(f"Training with following parameters\nn_steps: {n_steps}, multi: {multi}, lr: {lr}, gamma: {gamma}, entropy_coef: {entropy_coef}")
+            # Global actor 선언 
+            global_actor = ActorCritic()
+            global_actor.share_memory()
 
-    for params in grid:
-        torch.manual_seed(77)
-        np.random.seed(1)
+            # Global - local worker 간 공유되는 에피소드 카운트, 대기 조건, 학습 종료 조건 선언
+            global_epi = mp.Value('i', 0)
+            sync = mp.Condition()
+            finish = mp.Value('i', 0)
 
-        start_time = time.time()
+            # Multiprocessing
+            processes = []
 
-        n_steps = params['n_steps']
-        multi = params['multi']
-        lr = params['learning_rate']
-        gamma = params['gamma']
+            for rank in range(multi + 1):
+                # Global actor의 evaluation
+                if rank == 0:
+                    p = mp.Process(target=evaluate_grid_search, args=(global_actor, global_epi, sync, finish, multi, params))
+                    p.start()
 
-        # Global actor 선언 
-        global_actor = ActorCritic()
-        global_actor.share_memory()
+                # Local worker의 learning
+                else:
+                    worker = Worker(global_actor, global_epi, sync, finish, n_steps, rank, lr, gamma, entropy_coef)
+                    p = mp.Process(target=worker.train)
+                    p.start()
+                    processes.append(p)
 
-        # Global - local worker 간 공유되는 에피소드 카운트, 대기 조건, 학습 종료 조건 선언
-        global_epi = mp.Value('i', 0)
-        sync = mp.Condition()
-        finish = mp.Value('i', 0)
+            for p in processes:
+                p.join()
 
-        # Multiprocessing
-        processes = []
-
-        for rank in range(multi + 1):
-            # Global actor의 evaluation
-            if rank == 0:
-                p = mp.Process(target=evaluate_grid_search, args=(global_actor, global_epi, sync, finish, multi))
-                p.start()
-
-            # Local worker의 learning
-            else:
-                worker = Worker(global_actor, global_epi, sync, finish, n_steps, rank, lr, gamma)
-                p = mp.Process(target=worker.train)
-                p.start()
-                processes.append(p)
-
-        for p in processes:
-            p.join()
-
-        print("Time : {:.2f}".format(time.time() - start_time))
-        print(f"Trained With Following Parameters\nn_steps: {n_steps}, multi: {multi}, lr: {lr}, gamma: {gamma}")
-
+            f1.write(f"Trained With Following Parameters\nn_steps: {n_steps}, multi: {multi}, lr: {lr}, gamma: {gamma} entropy_coef: {entropy_coef}\n")
+            f1.write("Time : {:.2f}\n".format(time.time() - start_time))
+            f1.write("=============================================\n")
+            f1.flush()
+        
+    f1.close()
     return worker
 
 if __name__ == '__main__':
@@ -274,8 +305,6 @@ if __name__ == '__main__':
         if menu == 1:
             visualize_env()
         elif menu == 2:
-            torch.manual_seed(77)
-            np.random.seed(1)
             model_free_RL_grid_search()
             # Grid Search for hyperparameters
         elif menu == 3:
